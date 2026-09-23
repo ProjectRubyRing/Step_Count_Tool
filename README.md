@@ -37,8 +37,8 @@ chmod +x /usr/local/bin/step_count.sh
 # Terraform をリソース単位でも計測し、未配置ファイルを他環境から推測
 ./step_count.sh -d /opt/terraform -r -E -o /var/tmp/report -p tf_steps
 
-# 環境ディレクトリを自動検出し、平均値で推測
-./step_count.sh -d /opt/terraform -E --envs auto --estimate-method mean
+# terraform/stacks 直下の環境ディレクトリを自動検出して推測
+./step_count.sh -d /opt/repo -E --envs auto
 
 # 空白行・コメント行も含めた総行数で計測し、CSV のみ出力
 ./step_count.sh -d /opt/terraform --include-blank --include-comment --no-excel
@@ -93,9 +93,13 @@ chmod +x /usr/local/bin/step_count.sh
 
 | オプション | 既定 | 説明 |
 |---|---|---|
-| `-E`, `--estimate` / `--no-estimate` | OFF | **未配置ファイルを他環境から推測する機能** |
-| `--envs LIST` | `j1,j2,j3,st,pr` | 環境ディレクトリ名。`auto` でルート直下を自動検出 |
-| `--estimate-method M` | `median` | `median`（中央値） / `mean`（平均値） / `max` / `min` |
+| `-E`, `--estimate` / `--no-estimate` | OFF | **未配置ファイルを基準環境（j1）から推測する機能** |
+| `--envs LIST` | `j1,j2,j3,st,pr` | 環境ディレクトリ名。`auto` で `--estimate-dir` 直下を自動検出 |
+| `--estimate-dir DIR` | `terraform/stacks` | 推測対象の環境ディレクトリが並ぶディレクトリ（`-d` からの相対パス） |
+| `--estimate-ref ENV` | `j1` | 推測の基準環境 |
+| `--estimate-exclude LIST` | `containers` | 推測対象から外すディレクトリ名（カンマ区切り） |
+
+> `--estimate-method` は廃止しました（指定しても警告を出して無視します）。
 
 ### 集計
 
@@ -172,25 +176,48 @@ UTF-8 を前提としています。CRLF 改行は自動的に除去して判定
 
 ## 6. 推測計測（`-E`）
 
-ルートディレクトリ直下に環境ディレクトリ（既定 `j1` `j2` `j3` `st` `pr`）がある構成を想定します。
+`terraform/stacks` 直下の環境ディレクトリ（`j1` `j2` `j3` `st` `pr`）が推測の対象です。
+**`j1` を基準環境**とし、他の環境に不足しているファイルを `j1` の実測値で補います。
 
 ```
 <ルート>/
-  ├ j1/network/vpc.tf
-  ├ j2/network/vpc.tf
-  ├ j3/network/vpc.tf      ← j3 には compute/ec2.tf が無い
-  ├ st/…
-  └ pr/…
+  ├ terraform/
+  │   └ stacks/
+  │       ├ j1/…   6 ファイル   ← 基準環境
+  │       ├ j2/…   6 ファイル   → j1 以上あるので推測しない
+  │       ├ j3/…   4 ファイル   → j1 より少ないので、j1 にだけあるファイル 2 件を推測
+  │       └ st/    (空)         → j1 のファイル 6 件をすべて推測
+  │                               pr はディレクトリが無いので推測しない
+  └ containers/
+      ├ j1/…                    ← 推測の対象外（環境別集計には含む）
+      └ j2/…
 ```
 
-- 全環境の**環境ディレクトリからの相対パス**の和集合を取り、
-  **ある環境に存在しないファイル**を抽出します
-- そのファイルが存在する**他環境の実測値**から、
-  空白行数・コメント行数・コード行数をそれぞれ `median` / `mean` / `max` / `min` で推測します
-  （総行数は 3 者の合計として算出するため、内訳と総行数は常に整合します）
-- 推測した行は区分 `推測` として、**拡張子別集計・全体集計にも合算**されます
-- 参照元の環境名は「推測根拠」列に出力されます（例: `j1,j2,st の中央値 (3環境)`）
-- 環境ディレクトリ配下に無いファイルは `(環境外)` として扱い、推測の対象外です
+推測の条件は次のとおりです。
+
+| 環境ディレクトリの状態 | 推測 |
+|---|---|
+| ディレクトリが存在しない | **行わない** |
+| 存在するが空（対象ファイル 0 件） | `j1` のファイルをすべて推測 |
+| 存在し、ファイル数が `j1` より少ない | `j1` にあって当該環境に無いファイル（同じ相対パス）を推測 |
+| 存在し、ファイル数が `j1` 以上 | 行わない |
+
+- ファイル数は対象拡張子（`--ext`）のファイルで数えます。`.gitkeep` などは数えません
+- 推測したファイルの空白行数・コメント行数・コード行数は、`j1` の同じ相対パスのファイルの実測値です
+- **`containers` 配下は推測の対象外**です。ルート直下の `containers/` はもちろん、
+  `terraform/stacks/j1/containers/` のように環境ディレクトリ内にあっても、
+  ファイル数にも推測元にも含めません（`--estimate-exclude` で変更可）
+- 推測した行は区分 `推測` として、**拡張子別集計・環境別集計・全体集計にも合算**されます
+- 判定の内容は「推測根拠」列（例: `j3 のファイル数 4 < j1 のファイル数 6 (参照: terraform/stacks/j1/compute/ec2.tf)`）と、
+  サマリシートの「推測の判定」に出力されます
+- `-d` に `terraform` や `terraform/stacks` を指定した場合も、`--estimate-dir` を省略していれば
+  `stacks` / `.` を推測対象ディレクトリとして扱います
+
+### 環境別集計での環境の判定
+
+パスの途中に環境ディレクトリ名（`--envs`）が現れたファイルは、その環境として集計します
+（例: `containers/j1/app/run.sh` は `j1`）。
+どの階層にも現れないファイルは `(環境外)` として集計します。
 
 > リソース単位の明細は実測ファイルのみが対象です（推測はファイル単位で行います）。
 
@@ -238,8 +265,17 @@ UTF-8 を前提としています。CRLF 改行は自動的に除去して判定
 
 ## 8. 動作確認用サンプル
 
-`sample/` に検証用のディレクトリツリーを同梱しています
-（`j1` `j2` `j3` `st` `pr` の 5 環境＋環境外の `common`。一部の環境にわざとファイルを置いていません）。
+`sample/` に検証用のディレクトリツリーを同梱しています。
+
+| パス | 内容 |
+|---|---|
+| `terraform/stacks/j1` | 基準環境（6 ファイル） |
+| `terraform/stacks/j2` | 6 ファイル（推測しない） |
+| `terraform/stacks/j3` | 4 ファイル（2 件を推測） |
+| `terraform/stacks/st` | 空ディレクトリ（6 件を推測） |
+| `terraform/stacks/pr` | 存在しない（推測しない） |
+| `containers/j1` `containers/j2` | 推測の対象外 |
+| `common` | 環境外 |
 
 ```bash
 ./step_count.sh -d sample -o out -r -E
