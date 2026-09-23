@@ -37,7 +37,7 @@ chmod +x /usr/local/bin/step_count.sh
 # Terraform をリソース単位でも計測し、未配置ファイルを他環境から推測
 ./step_count.sh -d /opt/terraform -r -E -o /var/tmp/report -p tf_steps
 
-# terraform/stacks 直下の環境ディレクトリを自動検出して推測
+# 配置先（terraform/stacks/*/env など）直下の環境ディレクトリを自動検出して推測
 ./step_count.sh -d /opt/repo -E --envs auto
 
 # 空白行・コメント行も含めた総行数で計測し、CSV のみ出力
@@ -89,16 +89,22 @@ chmod +x /usr/local/bin/step_count.sh
 |---|---|---|
 | `-r`, `--resource` / `--no-resource` | OFF | **リソース（ブロック）単位で計測する機能** |
 
+### 環境ディレクトリ
+
+| オプション | 既定 | 説明 |
+|---|---|---|
+| `--envs LIST` | `j1,j2,j3,st,pr` | 環境ディレクトリ名。`auto` で配置先直下のディレクトリを自動検出 |
+| `--env-base LIST` | `terraform/stacks/*/env,`<br>`scripts/cicd/*/build_stage,`<br>`scripts/cicd/*/merge_stage` | 環境ディレクトリの配置先（`-d` からの相対パス、カンマ区切り、`*` などのワイルドカード可） |
+
 ### 推測計測
 
 | オプション | 既定 | 説明 |
 |---|---|---|
-| `-E`, `--estimate` / `--no-estimate` | OFF | **未配置ファイルを基準環境（j1）から推測する機能** |
-| `--envs LIST` | `j1,j2,j3,st,pr` | 環境ディレクトリ名。`auto` で `--estimate-dir` 直下を自動検出 |
-| `--estimate-dir DIR` | `terraform/stacks` | 推測対象の環境ディレクトリが並ぶディレクトリ（`-d` からの相対パス） |
+| `-E`, `--estimate` / `--no-estimate` | OFF | **未配置ファイルを基準環境（j1）から推測する機能**（配置先ごとに比較） |
 | `--estimate-ref ENV` | `j1` | 推測の基準環境 |
 | `--estimate-exclude LIST` | `containers` | 推測対象から外すディレクトリ名（カンマ区切り） |
 
+> `--estimate-dir` は `--env-base` の旧名です（同じ意味で引き続き使用できます）。
 > `--estimate-method` は廃止しました（指定しても警告を出して無視します）。
 
 ### 集計
@@ -174,50 +180,83 @@ UTF-8 を前提としています。CRLF 改行は自動的に除去して判定
 
 ---
 
-## 6. 推測計測（`-E`）
+## 6. 環境ディレクトリと推測計測（`-E`）
 
-`terraform/stacks` 直下の環境ディレクトリ（`j1` `j2` `j3` `st` `pr`）が推測の対象です。
-**`j1` を基準環境**とし、他の環境に不足しているファイルを `j1` の実測値で補います。
+### 環境ディレクトリの配置先
+
+環境ディレクトリ（`j1` `j2` `j3` `st` `pr`）は、次の**配置先**の直下にあるものとして判定します
+（`--env-base` で変更可、`*` は任意の 1 階層）。
+
+| 配置先（既定） | 該当するディレクトリの例 |
+|---|---|
+| `terraform/stacks/*/env` | `terraform/stacks/01-workload/env/j1`<br>`terraform/stacks/02-apprelease/env/j1`<br>`terraform/stacks/03-dbrelease/env/j1` |
+| `scripts/cicd/*/build_stage` | `scripts/cicd/app_release/build_stage/j1` |
+| `scripts/cicd/*/merge_stage` | `scripts/cicd/app_release/merge_stage/j1` |
+
+### 推測計測
+
+推測は**配置先ごと**に行います。各配置先の **`j1` を基準環境**とし、
+同じ配置先の他の環境に不足しているファイルを、その配置先の `j1` の実測値で補います。
 
 ```
 <ルート>/
-  ├ terraform/
-  │   └ stacks/
-  │       ├ j1/…   6 ファイル   ← 基準環境
-  │       ├ j2/…   6 ファイル   → j1 以上あるので推測しない
-  │       ├ j3/…   4 ファイル   → j1 より少ないので、j1 にだけあるファイル 2 件を推測
-  │       └ st/    (空)         → j1 のファイル 6 件をすべて推測
-  │                               pr はディレクトリが無いので推測しない
+  ├ terraform/stacks/
+  │   ├ 01-workload/env/            ← 配置先
+  │   │   ├ j1/…   6 ファイル       ← 基準環境
+  │   │   ├ j2/…   6 ファイル       → j1 以上あるので推測しない
+  │   │   ├ j3/…   4 ファイル       → j1 より少ないので、j1 にだけあるファイル 2 件を推測
+  │   │   └ st/    (空)             → j1 のファイル 6 件をすべて推測
+  │   │                               pr はディレクトリが無いので推測しない
+  │   ├ 02-apprelease/env/          ← 配置先（01-workload とは独立して j1 と比較）
+  │   │   ├ j1/…   2 ファイル
+  │   │   ├ j2/…   2 ファイル       → 推測しない
+  │   │   └ st/…   1 ファイル       → 1 件を推測
+  │   └ 03-dbrelease/env/           ← 配置先
+  │       ├ j1/…   2 ファイル
+  │       └ j2/    (空)             → 2 件を推測
+  ├ scripts/cicd/app_release/
+  │   ├ build_stage/                ← 配置先
+  │   │   ├ j1/…   2 ファイル
+  │   │   └ j2/…   1 ファイル       → 1 件を推測
+  │   └ merge_stage/                ← 配置先
+  │       ├ j1/…   1 ファイル
+  │       └ j2/…   1 ファイル       → 推測しない
   └ containers/
-      ├ j1/…                    ← 推測の対象外（環境別集計には含む）
+      ├ j1/…                        ← 配置先の外なので推測の対象外（環境別集計には含む）
       └ j2/…
 ```
 
-推測の条件は次のとおりです。
+推測の条件は次のとおりです（配置先ごとに判定）。
 
 | 環境ディレクトリの状態 | 推測 |
 |---|---|
+| 配置先に `j1` が存在しない | **行わない** |
 | ディレクトリが存在しない | **行わない** |
 | 存在するが空（対象ファイル 0 件） | `j1` のファイルをすべて推測 |
 | 存在し、ファイル数が `j1` より少ない | `j1` にあって当該環境に無いファイル（同じ相対パス）を推測 |
 | 存在し、ファイル数が `j1` 以上 | 行わない |
 
 - ファイル数は対象拡張子（`--ext`）のファイルで数えます。`.gitkeep` などは数えません
-- 推測したファイルの空白行数・コメント行数・コード行数は、`j1` の同じ相対パスのファイルの実測値です
+- 推測したファイルの空白行数・コメント行数・コード行数は、同じ配置先の `j1` の同じ相対パスのファイルの実測値です
 - **`containers` 配下は推測の対象外**です。ルート直下の `containers/` はもちろん、
-  `terraform/stacks/j1/containers/` のように環境ディレクトリ内にあっても、
+  `terraform/stacks/01-workload/env/j1/containers/` のように環境ディレクトリ内にあっても、
   ファイル数にも推測元にも含めません（`--estimate-exclude` で変更可）
 - 推測した行は区分 `推測` として、**拡張子別集計・環境別集計・全体集計にも合算**されます
-- 判定の内容は「推測根拠」列（例: `j3 のファイル数 4 < j1 のファイル数 6 (参照: terraform/stacks/j1/compute/ec2.tf)`）と、
-  サマリシートの「推測の判定」に出力されます
-- `-d` に `terraform` や `terraform/stacks` を指定した場合も、`--estimate-dir` を省略していれば
-  `stacks` / `.` を推測対象ディレクトリとして扱います
+- 判定の内容は「推測根拠」列（例: `j3 のファイル数 4 < j1 のファイル数 6 (参照: terraform/stacks/01-workload/env/j1/compute/ec2.tf)`）と、
+  サマリシートの「推測の判定」（配置先ごとに 1 行）に出力されます
+- `-d` に `terraform` や `terraform/stacks`、`terraform/stacks/01-workload` などの途中の階層を指定した場合も、
+  `--env-base` を省略していれば既定の配置先をそこからの相対パスに読み替えます
+  （例: `-d terraform/stacks` → `*/env`）
 
 ### 環境別集計での環境の判定
 
-パスの途中に環境ディレクトリ名（`--envs`）が現れたファイルは、その環境として集計します
-（例: `containers/j1/app/run.sh` は `j1`）。
-どの階層にも現れないファイルは `(環境外)` として集計します。
+1. 配置先の直下にある環境ディレクトリ配下のファイルは、その環境として集計します
+   （例: `terraform/stacks/02-apprelease/env/j2/main.tf` は `j2`）
+2. 配置先の外にあるファイルは、パスの途中に環境ディレクトリ名（`--envs`）が現れれば、その環境として集計します
+   （例: `containers/j1/app/run.sh` は `j1`）
+3. どちらにも当てはまらないファイルは `(環境外)` として集計します
+
+環境別集計は、配置先をまたいで環境ごとに合算した値です（配置先ごとの内訳は「ファイル別」シートのパスで絞り込めます）。
 
 > リソース単位の明細は実測ファイルのみが対象です（推測はファイル単位で行います）。
 
@@ -269,11 +308,15 @@ UTF-8 を前提としています。CRLF 改行は自動的に除去して判定
 
 | パス | 内容 |
 |---|---|
-| `terraform/stacks/j1` | 基準環境（6 ファイル） |
-| `terraform/stacks/j2` | 6 ファイル（推測しない） |
-| `terraform/stacks/j3` | 4 ファイル（2 件を推測） |
-| `terraform/stacks/st` | 空ディレクトリ（6 件を推測） |
-| `terraform/stacks/pr` | 存在しない（推測しない） |
+| `terraform/stacks/01-workload/env/j1` | 基準環境（6 ファイル） |
+| `terraform/stacks/01-workload/env/j2` | 6 ファイル（推測しない） |
+| `terraform/stacks/01-workload/env/j3` | 4 ファイル（2 件を推測） |
+| `terraform/stacks/01-workload/env/st` | 空ディレクトリ（6 件を推測） |
+| `terraform/stacks/01-workload/env/pr` | 存在しない（推測しない） |
+| `terraform/stacks/02-apprelease/env/{j1,j2,st}` | j1・j2 は 2 ファイル、st は 1 ファイル（1 件を推測） |
+| `terraform/stacks/03-dbrelease/env/{j1,j2}` | j1 は 2 ファイル、j2 は空ディレクトリ（2 件を推測） |
+| `scripts/cicd/app_release/build_stage/{j1,j2}` | j1 は 2 ファイル、j2 は 1 ファイル（1 件を推測） |
+| `scripts/cicd/app_release/merge_stage/{j1,j2}` | 各 1 ファイル（推測しない） |
 | `containers/j1` `containers/j2` | 推測の対象外 |
 | `common` | 環境外 |
 

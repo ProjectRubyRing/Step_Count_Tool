@@ -34,8 +34,8 @@ OPT_ATTACH_COMMENT=1
 OPT_RESOURCE=0
 OPT_ESTIMATE=0
 OPT_ENVS="j1,j2,j3,st,pr"
-OPT_EST_DIR="terraform/stacks"
-OPT_EST_DIR_SET=0
+OPT_ENV_BASE="terraform/stacks/*/env,scripts/cicd/*/build_stage,scripts/cicd/*/merge_stage"
+OPT_ENV_BASE_SET=0
 OPT_EST_REF="j1"
 OPT_EST_EXCLUDE="containers"
 OPT_SUMMARY_EXT=1
@@ -107,12 +107,17 @@ usage() {
    -r, --resource             リソース(ブロック)単位でも計測する
        --no-resource          リソース単位計測を行わない     (既定)
 
+ [環境ディレクトリ]
+       --envs LIST            環境ディレクトリ名 (カンマ区切り / auto で配置先直下を自動検出)
+                              (既定: j1,j2,j3,st,pr)
+       --env-base LIST        環境ディレクトリの配置先 (-d からの相対パス, カンマ区切り, * 可)
+                              (既定: terraform/stacks/*/env,
+                                     scripts/cicd/*/build_stage,
+                                     scripts/cicd/*/merge_stage)
+
  [推測計測]
    -E, --estimate             基準環境の実測値から未配置ファイルを推測計測する
-       --envs LIST            環境ディレクトリ名 (カンマ区切り / auto で自動検出)
-                              (既定: j1,j2,j3,st,pr)
-       --estimate-dir DIR     推測対象の環境ディレクトリが並ぶディレクトリ
-                              (-d からの相対パス, 既定: terraform/stacks)
+                              (配置先ごとに基準環境と比較)
        --estimate-ref ENV     推測の基準環境                 (既定: j1)
        --estimate-exclude LIST
                               推測対象から外すディレクトリ名 (既定: containers)
@@ -159,7 +164,8 @@ parse_args() {
       -e|--ext)               need_value "$@"; OPT_EXTS="$2";          shift 2 ;;
       -x|--exclude-dir)       need_value "$@"; OPT_EXCLUDE_DIRS="$2";  shift 2 ;;
       --envs)                 need_value "$@"; OPT_ENVS="$2";          shift 2 ;;
-      --estimate-dir)         need_value "$@"; OPT_EST_DIR="$2"; OPT_EST_DIR_SET=1; shift 2 ;;
+      --env-base|--estimate-dir)
+                              need_value "$@"; OPT_ENV_BASE="$2"; OPT_ENV_BASE_SET=1; shift 2 ;;
       --estimate-ref)         need_value "$@"; OPT_EST_REF="$2";       shift 2 ;;
       --estimate-exclude)     need_value "$@"; OPT_EST_EXCLUDE="$2";   shift 2 ;;
       --estimate-method)      need_value "$@"
@@ -257,7 +263,9 @@ write_awk_counter() {
 #-------------------------------------------------------------------------------
 # 入力  : 対象ファイル群 (ルートディレクトリからの相対パス)
 # 変数  : ENVS            環境ディレクトリ名 (カンマ区切り)
-#                         パス中で最初に現れた環境ディレクトリ名をそのファイルの環境とする
+#         BASES           環境ディレクトリの配置先 (カンマ区切り / "." はルート直下)
+#                         配置先直下の環境ディレクトリをそのファイルの環境とする
+#                         配置先の外では、パス中で最初に現れた環境ディレクトリ名とする
 #         WANT_RES        1 なら Terraform ブロック単位レコードも出力
 #         SHEBANG_COMMENT 1 なら 1行目のシェバンをコメント行として扱う
 #         ATTACH_COMMENT  1 ならブロック直前の連続コメントをブロックへ含める
@@ -317,9 +325,20 @@ function set_labels(s,   t, p, m, n) {
     }
 }
 
-# パス中で最初に現れる環境ディレクトリ名を環境、それ以降を相対パスとする (ファイル名は除く)
-function classify(p,   n, a, i, off) {
-    env = "-"; rel = p
+# 環境と、環境ディレクトリより後ろの相対パスを求める
+#   1) 配置先 (BASES) 直下の環境ディレクトリ (複数該当する場合は最も深い配置先)
+#   2) 配置先の外では、パス中で最初に現れる環境ディレクトリ名 (ファイル名は除く)
+function classify(p,   n, a, i, off, pre, rest, k, bl) {
+    env = "-"; rel = p; bl = -1
+    for (i = 1; i <= nbase; i++) {
+        pre = (BASE[i] == ".") ? "" : BASE[i] "/"
+        if (length(pre) <= bl || substr(p, 1, length(pre)) != pre) continue
+        rest = substr(p, length(pre) + 1)
+        k = index(rest, "/")
+        if (k == 0 || !(substr(rest, 1, k - 1) in envset)) continue
+        env = substr(rest, 1, k - 1); rel = substr(rest, k + 1); bl = length(pre)
+    }
+    if (bl >= 0) return
     n = split(p, a, "/")
     off = 0
     for (i = 1; i < n; i++) {
@@ -405,8 +424,9 @@ function record(cls, scan) {
     if (scan == 1 && cls == "X") detect_hd()
 }
 
-function start_file() {
-    curfile = FILENAME
+function start_file(f) {
+    seen[f] = 1
+    curfile = f
     sub(/^\.\//, "", curfile)
     ext = curfile
     if (ext ~ /\./) sub(/^.*\./, "", ext); else ext = ""
@@ -437,13 +457,14 @@ BEGIN {
     RE_STR = "\"(" BS BS ".|[^\"" BS BS "])*\""
     n = split(ENVS, ea, ",")
     for (i = 1; i <= n; i++) if (ea[i] != "") envset[ea[i]] = 1
+    nbase = split(BASES, BASE, ",")
     curfile = ""
     nres = 0
 }
 
 FNR == 1 {
     if (curfile != "") finish_file()
-    start_file()
+    start_file(FILENAME)
 }
 
 {
@@ -502,6 +523,12 @@ FNR == 1 {
 
 END {
     if (curfile != "") finish_file()
+    # 空ファイル (0 バイト) は 1 行も読まれないため、ここで 0 行として出力する
+    for (i = 1; i < ARGC; i++) {
+        if (ARGV[i] == "" || (ARGV[i] in seen)) continue
+        start_file(ARGV[i])
+        finish_file()
+    }
     close(FOUT)
     if (WANT_RES == 1) close(ROUT)
 }
@@ -510,70 +537,87 @@ __AWK_COUNTER_EOF__
 
 #-------------------------------------------------------------------------------
 # 未配置ファイルのステップ数推測
-#   <推測対象ディレクトリ>/<基準環境> (既定 terraform/stacks/j1) を基準とし、
-#   同じ階層に実在する他の環境ディレクトリのうち、ファイル数が基準環境より
-#   少ないもの (空を含む) について、基準環境にだけ存在するファイルを
-#   基準環境の実測値で補う
+#   環境ディレクトリの配置先 (例 terraform/stacks/01-workload/env) ごとに、
+#   <配置先>/<基準環境> を基準とし、同じ配置先に実在する他の環境ディレクトリの
+#   うち、ファイル数が基準環境より少ないもの (空を含む) について、
+#   基準環境にだけ存在するファイルを基準環境の実測値で補う
 #-------------------------------------------------------------------------------
 write_awk_estimate() {
   cat > "$1" <<'__AWK_EST_EOF__'
 #-------------------------------------------------------------------------------
 # 入力 : ファイル単位レコード (実測)
-# 変数 : BASEDIR  推測対象の環境ディレクトリが並ぶディレクトリ ("." はルート直下)
+# 変数 : BASES    環境ディレクトリの配置先 (カンマ区切り / "." はルート直下)
 #        REF      基準環境
-#        ENVS     BASEDIR 直下に実在する環境ディレクトリ (カンマ区切り / REF を含む)
+#        ENVS     環境ディレクトリ名 (カンマ区切り / 表示順)
+#        EXISTF   実在する環境ディレクトリの一覧 (配置先<TAB>環境)
 #        EXCLUDE  推測対象から外すディレクトリ名 (カンマ区切り)
-#        STATF    環境ごとの判定結果の出力先 (環境/実ファイル数/基準ファイル数/推測件数)
+#        STATF    配置先ごとの判定結果の出力先 (配置先<TAB>判定内容)
 # 出力 : 推測レコード (区分 = 推測)
 #-------------------------------------------------------------------------------
+function prefix(b) { return (b == ".") ? "" : b "/" }
+
 BEGIN {
     FS = "\t"
-    pre = (BASEDIR == "" || BASEDIR == ".") ? "" : BASEDIR "/"
+    nb = split(BASES, B, ",")
     ne = split(ENVS, E, ",")
-    for (i = 1; i <= ne; i++) if (E[i] != "") eset[E[i]] = 1
     n = split(EXCLUDE, a, ",")
     for (i = 1; i <= n; i++) if (a[i] != "") xset[a[i]] = 1
-    nref = 0
+    while ((getline ln < EXISTF) > 0) { split(ln, a, "\t"); exist[a[1], a[2]] = 1 }
+    close(EXISTF)
 }
 
 $5 == "実測" {
-    p = $3
-    if (pre != "") {
-        if (substr(p, 1, length(pre)) != pre) next
-        p = substr(p, length(pre) + 1)
+    # ファイルが属する配置先 (複数該当する場合は最も深い配置先)
+    base = ""; bl = -1
+    for (i = 1; i <= nb; i++) {
+        pre = prefix(B[i])
+        if (length(pre) <= bl || substr($3, 1, length(pre)) != pre) continue
+        if (split(substr($3, length(pre) + 1), a, "/") < 2 || !((B[i], a[1]) in exist)) continue
+        base = B[i]; bl = length(pre)
     }
-    n = split(p, a, "/")
-    if (n < 2 || !(a[1] in eset)) next
+    if (bl < 0) next
+    n = split(substr($3, bl + 1), a, "/")
     for (i = 2; i < n; i++) if (a[i] in xset) next
     env = a[1]
-    rel = substr(p, length(env) + 2)
-    cnt[env]++
-    have[env, rel] = 1
+    rel = substr($3, bl + length(env) + 2)
+    cnt[base, env]++
+    have[base, env, rel] = 1
     if (env == REF) {
-        nref++; R[nref] = rel
-        RE[rel] = $4; RB[rel] = $7 + 0; RC[rel] = $8 + 0; RX[rel] = $9 + 0
+        k = ++nref[base]; R[base, k] = rel
+        RE[base, rel] = $4; RB[base, rel] = $7 + 0; RC[base, rel] = $8 + 0; RX[base, rel] = $9 + 0
     }
 }
 
 END {
-    for (i = 1; i <= ne; i++) {
-        e = E[i]
-        if (e == "" || e == REF) continue
-        c = cnt[e] + 0
-        k = 0
-        if (c < nref) {
-            basis = sprintf("%s のファイル数 %d < %s のファイル数 %d", e, c, REF, nref)
-            for (j = 1; j <= nref; j++) {
-                rel = R[j]
-                if ((e SUBSEP rel) in have) continue
-                k++
-                printf "%s\t%s\t%s%s/%s\t%s\t%s\t%d\t%d\t%d\t%d\t%s (参照: %s%s/%s)\n", \
-                    e, rel, pre, e, rel, RE[rel], "推測", \
-                    RB[rel] + RC[rel] + RX[rel], RB[rel], RC[rel], RX[rel], \
-                    basis, pre, REF, rel
-            }
+    for (i = 1; i <= nb; i++) {
+        b = B[i]; pre = prefix(b); nr = nref[b] + 0
+        if (!((b, REF) in exist)) {
+            printf "%s\t基準環境 %s なし (推測しない)\n", b, REF > STATF
+            continue
         }
-        printf "%s\t%d\t%d\t%d\n", e, c, nref, k > STATF
+        note = ""
+        for (j = 1; j <= ne; j++) {
+            e = E[j]
+            if (e == "" || e == REF) continue
+            if (!((b, e) in exist)) { note = note (note == "" ? "" : "    ") e ": ディレクトリなし (推測しない)"; continue }
+            c = cnt[b, e] + 0
+            k = 0
+            if (c < nr) {
+                basis = sprintf("%s のファイル数 %d < %s のファイル数 %d", e, c, REF, nr)
+                for (m = 1; m <= nr; m++) {
+                    rel = R[b, m]
+                    if ((b, e, rel) in have) continue
+                    k++
+                    printf "%s\t%s\t%s%s/%s\t%s\t%s\t%d\t%d\t%d\t%d\t%s (参照: %s%s/%s)\n", \
+                        e, rel, pre, e, rel, RE[b, rel], "推測", \
+                        RB[b, rel] + RC[b, rel] + RX[b, rel], RB[b, rel], RC[b, rel], RX[b, rel], \
+                        basis, pre, REF, rel
+                }
+            }
+            note = note (note == "" ? "" : "    ") \
+                sprintf("%s: %s (%d ファイル / %s: %d ファイル)", e, (k > 0 ? k " 件推測" : "推測なし"), c, REF, nr)
+        }
+        printf "%s\t%s\n", b, (note == "" ? "比較する環境なし" : note) > STATF
     }
     close(STATF)
 }
@@ -1280,48 +1324,83 @@ __PYZIP_EOF__
 
 #-------------------------------------------------------------------------------
 # 環境ディレクトリの決定
-#   ENV_LIST : 環境ディレクトリ名 (集計用)。パス中のどの階層に現れても環境として扱う
-#   EST_DIR  : 推測対象の環境ディレクトリが並ぶディレクトリ (ルートからの相対パス)
-#   EST_ENVS : EST_DIR 直下に実在する環境ディレクトリ (推測はこの範囲でのみ行う)
+#   ENV_LIST  : 環境ディレクトリ名 (集計用)
+#   ENV_BASES : 環境ディレクトリの配置先 (--env-base を展開した実在ディレクトリ /
+#               ルートからの相対パス)。配置先直下の環境ディレクトリで環境を判定し、
+#               推測も配置先ごとに行う
+#   F_ENV_DIRS: 実在する環境ディレクトリの一覧 (配置先<TAB>環境)
 #-------------------------------------------------------------------------------
 ENV_LIST=""
 ENV_FOUND=""
-EST_DIR=""
-EST_REF_PATH=""
-EST_ENVS=""
+ENV_BASES=""
 
 # カンマ区切りリストに含まれるか
 in_csv() { case ",$2," in *",$1,"*) return 0 ;; esac; return 1; }
 
-resolve_est_dir() {
-  local d="${OPT_EST_DIR%/}"
-  d="${d#./}"
-  [ -z "$d" ] && d="."
-  # 既定値のままで見つからない場合は、-d に terraform / terraform/stacks を指定したものとみなす
-  if [ ! -d "$ROOT_ABS/$d" ] && [ "$OPT_EST_DIR_SET" -eq 0 ]; then
-    case "$ROOT_ABS" in
-      */terraform/stacks) d="." ;;
-      */terraform)        [ -d "$ROOT_ABS/stacks" ] && d="stacks" ;;
-    esac
-  fi
-  EST_DIR="$d"
-  if [ "$d" = "." ]; then EST_REF_PATH="$OPT_EST_REF"; else EST_REF_PATH="$d/$OPT_EST_REF"; fi
+# 配置先パターン (glob 可) に一致するディレクトリを列挙する
+expand_env_base() {
+  ( cd "$ROOT_ABS" || exit 0
+    shopt -s nullglob
+    IFS=
+    for d in $1; do [ -d "$d" ] && printf '%s\n' "${d%/}"; done ) | LC_ALL=C sort
+}
+
+# -d に配置先の途中 (terraform, terraform/stacks など) を指定した場合に、
+# ルート末尾と一致するパターン先頭を取り除いたパターンを返す (全体が一致すれば ".")
+align_env_base() {
+  local k i n m ok rest
+  local -a pp=() rr=()
+  IFS='/' read -r -a pp <<< "$1"
+  IFS='/' read -r -a rr <<< "${ROOT_ABS#/}"
+  n=${#pp[@]}; m=${#rr[@]}
+  for (( k = n; k >= 1; k-- )); do
+    [ "$k" -le "$m" ] || continue
+    ok=1
+    for (( i = 0; i < k; i++ )); do
+      [[ "${rr[m - k + i]}" == ${pp[i]} ]] || { ok=0; break; }
+    done
+    [ "$ok" -eq 1 ] || continue
+    rest=""
+    for (( i = k; i < n; i++ )); do rest="${rest:+$rest/}${pp[i]}"; done
+    printf '%s\n' "${rest:-.}"
+    return 0
+  done
+}
+
+resolve_env_bases() {
+  local pat alt d out=""
+  local -a pats=() hits=()
+  IFS=',' read -r -a pats <<< "$OPT_ENV_BASE"
+  for pat in "${pats[@]+"${pats[@]}"}"; do
+    pat="${pat%/}"; pat="${pat#./}"
+    [ -z "$pat" ] && continue
+    mapfile -t hits < <(expand_env_base "$pat")
+    if [ "${#hits[@]}" -eq 0 ] && [ "$OPT_ENV_BASE_SET" -eq 0 ]; then
+      alt="$(align_env_base "$pat")"
+      [ -n "$alt" ] && mapfile -t hits < <(expand_env_base "$alt")
+    fi
+    for d in "${hits[@]+"${hits[@]}"}"; do
+      in_csv "$d" "$out" || out="${out:+$out,}$d"
+    done
+  done
+  ENV_BASES="$out"
 }
 
 detect_envs() {
-  local d out="" est=""
-  local -a arr=()
-  resolve_est_dir
+  local d b out=""
+  local -a arr=() bases=()
+  resolve_env_bases
+  IFS=',' read -r -a bases <<< "$ENV_BASES"
   if [ "$OPT_ENVS" = "auto" ]; then
-    # 推測対象ディレクトリ直下のディレクトリを環境とみなす
-    if [ -d "$ROOT_ABS/$EST_DIR" ]; then
-      while IFS= read -r d; do
-        [ -z "$d" ] && continue
-        in_csv "$d" "$OPT_EXCLUDE_DIRS" && continue
-        in_csv "$d" "$OPT_EST_EXCLUDE" && continue
-        out="${out:+$out,}$d"
-      done < <( cd "$ROOT_ABS/$EST_DIR" && find . -mindepth 1 -maxdepth 1 -type d -print | sed 's|^\./||' | LC_ALL=C sort )
-    fi
+    # 配置先直下のディレクトリを環境とみなす
+    while IFS= read -r d; do
+      [ -z "$d" ] && continue
+      in_csv "$d" "$OPT_EXCLUDE_DIRS" && continue
+      in_csv "$d" "$OPT_EST_EXCLUDE" && continue
+      out="${out:+$out,}$d"
+    done < <( for b in "${bases[@]+"${bases[@]}"}"; do
+                ( cd "$ROOT_ABS/$b" && find . -mindepth 1 -maxdepth 1 -type d -print )
+              done | sed 's|^\./||' | LC_ALL=C sort -u )
   else
     IFS=',' read -r -a arr <<< "$OPT_ENVS"
     for d in "${arr[@]+"${arr[@]}"}"; do
@@ -1331,15 +1410,21 @@ detect_envs() {
   fi
   ENV_LIST="$out"
 
+  : > "$F_ENV_DIRS"
   IFS=',' read -r -a arr <<< "$ENV_LIST"
-  for d in "${arr[@]+"${arr[@]}"}"; do
-    [ -d "$ROOT_ABS/$EST_DIR/$d" ] && est="${est:+$est,}$d"
+  for b in "${bases[@]+"${bases[@]}"}"; do
+    for d in "${arr[@]+"${arr[@]}"}"; do
+      [ -d "$ROOT_ABS/$b/$d" ] && printf '%s\t%s\n' "$b" "$d" >> "$F_ENV_DIRS"
+    done
   done
-  EST_ENVS="$est"
 
   log_info "環境ディレクトリ: ${ENV_LIST:-(該当なし)}"
+  log_info "環境ディレクトリの配置先: ${ENV_BASES:-(該当なし: ${OPT_ENV_BASE})}"
   if [ "$OPT_ESTIMATE" -eq 1 ]; then
-    log_info "推測対象ディレクトリ: ${EST_DIR} (実在する環境: ${EST_ENVS:-なし} / 対象外: ${OPT_EST_EXCLUDE:-なし})"
+    for b in "${bases[@]+"${bases[@]}"}"; do
+      d="$(awk -F'\t' -v b="$b" '$1 == b { o = o (o == "" ? "" : ",") $2 } END { print o }' "$F_ENV_DIRS")"
+      log_info "  ${b}  (実在する環境: ${d:-なし})"
+    done
   fi
 }
 
@@ -1383,6 +1468,7 @@ discover_files() {
 run_counter() {
   ( cd "$ROOT_ABS" && awk \
       -v ENVS="$ENV_LIST" \
+      -v BASES="$ENV_BASES" \
       -v WANT_RES="$OPT_RESOURCE" \
       -v SHEBANG_COMMENT="$OPT_SHEBANG_COMMENT" \
       -v ATTACH_COMMENT="$OPT_ATTACH_COMMENT" \
@@ -1408,23 +1494,6 @@ count_files() {
   if [ "${#chunk[@]}" -gt 0 ]; then
     run_counter "${chunk[@]}" || die "計測処理に失敗しました"
   fi
-
-  # 空ファイル (0 バイト) は awk のレコードが生成されないため補完する
-  awk -F'\t' -v ENVS="$ENV_LIST" '
-    BEGIN { n = split(ENVS, ea, ","); for (i = 1; i <= n; i++) if (ea[i] != "") es[ea[i]] = 1 }
-    NR == FNR { seen[$3] = 1; next }
-    {
-      if ($0 in seen) next
-      p = $0
-      ext = p; if (ext ~ /\./) sub(/^.*\./, "", ext); else ext = ""
-      env = "-"; rel = p
-      m = split(p, a, "/"); off = 0
-      for (i = 1; i < m; i++) {
-        off += length(a[i]) + 1
-        if (a[i] in es) { env = a[i]; rel = substr(p, off + 1); break }
-      }
-      printf "%s\t%s\t%s\t%s\t%s\t0\t0\t0\t0\t\n", env, rel, p, ext, "実測"
-    }' "$F_FILES" "$WORK/filelist.txt" >> "$F_FILES"
 }
 
 #-------------------------------------------------------------------------------
@@ -1432,50 +1501,35 @@ count_files() {
 #-------------------------------------------------------------------------------
 EST_COUNT=0
 EST_SKIP=""
-EST_DETAIL=""
 estimate_files() {
-  EST_COUNT=0; EST_SKIP=""; EST_DETAIL=""
+  EST_COUNT=0; EST_SKIP=""
+  : > "$F_EST_STAT"
   [ "$OPT_ESTIMATE" -eq 1 ] || return 0
-  if [ ! -d "$ROOT_ABS/$EST_DIR" ]; then
-    EST_SKIP="推測対象ディレクトリ ${EST_DIR} が存在しない"
+  if [ -z "$ENV_BASES" ]; then
+    EST_SKIP="環境ディレクトリの配置先 (${OPT_ENV_BASE}) が存在しない"
   elif ! in_csv "$OPT_EST_REF" "$ENV_LIST"; then
     EST_SKIP="基準環境 ${OPT_EST_REF} が環境ディレクトリ (--envs) に含まれていない"
-  elif ! in_csv "$OPT_EST_REF" "$EST_ENVS"; then
-    EST_SKIP="基準環境 ${EST_REF_PATH} が存在しない"
+  elif ! awk -F'\t' -v r="$OPT_EST_REF" '$2 == r { f = 1 } END { exit !f }' "$F_ENV_DIRS"; then
+    EST_SKIP="基準環境 ${OPT_EST_REF} がどの配置先にも存在しない"
   fi
   if [ -n "$EST_SKIP" ]; then
     log_warn "${EST_SKIP}ため推測計測をスキップします"
     return 0
   fi
 
-  : > "$WORK/est_stat.tsv"
-  awk -v BASEDIR="$EST_DIR" -v REF="$OPT_EST_REF" -v ENVS="$EST_ENVS" \
-      -v EXCLUDE="$OPT_EST_EXCLUDE" -v STATF="$WORK/est_stat.tsv" \
+  awk -v BASES="$ENV_BASES" -v REF="$OPT_EST_REF" -v ENVS="$ENV_LIST" \
+      -v EXISTF="$F_ENV_DIRS" -v EXCLUDE="$OPT_EST_EXCLUDE" -v STATF="$F_EST_STAT" \
       -f "$AWK_EST" "$F_FILES" > "$WORK/est.tsv" || die "推測計測に失敗しました"
   EST_COUNT=$(grep -c . "$WORK/est.tsv" 2>/dev/null || true)
   [ -z "$EST_COUNT" ] && EST_COUNT=0
   [ "$EST_COUNT" -gt 0 ] && cat "$WORK/est.tsv" >> "$F_FILES"
 
-  # 環境ごとの判定結果 (ログ / 計測条件シート用)
-  local e note n_act n_ref n_est
-  local -a arr=()
-  IFS=',' read -r -a arr <<< "$ENV_LIST"
-  for e in "${arr[@]+"${arr[@]}"}"; do
-    [ "$e" = "$OPT_EST_REF" ] && continue
-    if ! in_csv "$e" "$EST_ENVS"; then
-      note="${e}: ディレクトリなし (推測しない)"
-    else
-      IFS=$'\t' read -r _ n_act n_ref n_est < <(awk -F'\t' -v e="$e" '$1 == e { print; exit }' "$WORK/est_stat.tsv")
-      if [ "${n_est:-0}" -gt 0 ]; then
-        note="${e}: ${n_est} 件推測 (${n_act} ファイル / ${OPT_EST_REF}: ${n_ref} ファイル)"
-      else
-        note="${e}: 推測なし (${n_act} ファイル / ${OPT_EST_REF}: ${n_ref} ファイル)"
-      fi
-    fi
-    log_info "推測計測  ${note}"
-    EST_DETAIL="${EST_DETAIL:+$EST_DETAIL    }${note}"
-  done
-  log_info "推測計測: ${EST_COUNT} 件 (基準環境 ${EST_REF_PATH} の実測値)"
+  # 配置先ごとの判定結果 (計測条件シートにも出力)
+  local b note
+  while IFS=$'\t' read -r b note; do
+    log_info "推測計測  ${b}  ${note}"
+  done < "$F_EST_STAT"
+  log_info "推測計測: ${EST_COUNT} 件 (配置先ごとの基準環境 ${OPT_EST_REF} の実測値)"
 }
 
 #-------------------------------------------------------------------------------
@@ -1499,7 +1553,7 @@ sort_records() {
   awk -F'\t' -v OFS='\t' -v ENVORDER="$ENV_LIST" '
     BEGIN { n = split(ENVORDER, E, ","); for (i = 1; i <= n; i++) idx[E[i]] = i }
     { k = ($1 == "-") ? 9999 : (($1 in idx) ? idx[$1] : 5000); print k, $0 }' "$F_FILES" \
-    | LC_ALL=C sort -t "$(printf '\t')" -k1,1n -k3,3 -k2,2 | cut -f2- > "$tmp" && mv "$tmp" "$F_FILES"
+    | LC_ALL=C sort -t "$(printf '\t')" -k1,1n -k4,4 | cut -f2- > "$tmp" && mv "$tmp" "$F_FILES"
   if [ -s "$F_RES" ]; then
     awk -F'\t' -v OFS='\t' -v ENVORDER="$ENV_LIST" '
       BEGIN { n = split(ENVORDER, E, ","); for (i = 1; i <= n; i++) idx[E[i]] = i }
@@ -1623,7 +1677,7 @@ build_meta_kpi() {
   [ "$OPT_SHEBANG_COMMENT" -eq 1 ] && yn_sheb="コメント行として扱う"    || yn_sheb="コード行として扱う"
   if [ "$OPT_RESOURCE" -eq 1 ]; then yn_res="実施 (検出ブロック数: ${RES_COUNT})"; else yn_res="未実施"; fi
   if [ "$OPT_ESTIMATE" -eq 1 ]; then
-    if [ -z "$EST_SKIP" ]; then yn_est="実施 / 基準環境 ${EST_REF_PATH} の実測値 (推測ファイル数: ${EST_COUNT})"
+    if [ -z "$EST_SKIP" ]; then yn_est="実施 / 配置先ごとに基準環境 ${OPT_EST_REF} の実測値 (推測ファイル数: ${EST_COUNT})"
     else yn_est="実施を指定 (${EST_SKIP}ためスキップ)"; fi
   else
     yn_est="未実施"
@@ -1640,10 +1694,12 @@ build_meta_kpi() {
     printf 'Terraform リソース単位計測\t%s\n' "$yn_res"
     printf '推測計測\t%s\n' "$yn_est"
     if [ "$OPT_ESTIMATE" -eq 1 ] && [ -z "$EST_SKIP" ]; then
-      printf '推測の判定\t%s\n' "${EST_DETAIL:-(比較する環境なし)}"
-      printf '推測の対象外\t%s\n' "${OPT_EST_EXCLUDE:+${OPT_EST_EXCLUDE} 配下 / }${EST_DIR} 以外の環境ディレクトリ"
+      # 配置先ごとに 1 行 (2 行目以降は項目名を空ける)
+      awk -F'\t' '{ printf "%s\t[%s]  %s\n", (NR == 1 ? "推測の判定" : ""), $1, $2 }' "$F_EST_STAT"
+      printf '推測の対象外\t%s\n' "${OPT_EST_EXCLUDE:+${OPT_EST_EXCLUDE} 配下 / }配置先の外にあるファイル"
     fi
     printf '環境ディレクトリ\t%s\n' "${ENV_FOUND:-(該当なし)}"
+    printf '環境ディレクトリの配置先\t%s\n' "${ENV_BASES:-(該当なし: ${OPT_ENV_BASE})}"
     printf '有効ステップ数の定義\t%s\n' "$EFF_DEF"
     printf '生成ツール\t%s\n' "$SCRIPT_NAME $SCRIPT_VERSION"
   } > "$F_META"
@@ -1706,7 +1762,7 @@ output_xlsx() {
 
   if [ -s "$V_EST" ]; then
     awk -v TITLE="推測計測 明細 (未配置ファイル)" \
-        -v SUBTITLE="${EST_DIR} 配下でファイル数が ${OPT_EST_REF} より少ない環境について、${OPT_EST_REF} にのみ存在するファイルを ${OPT_EST_REF} の実測値で推測しています" \
+        -v SUBTITLE="環境ディレクトリの配置先ごとに、ファイル数が ${OPT_EST_REF} より少ない環境について、同じ配置先の ${OPT_EST_REF} にのみ存在するファイルを ${OPT_EST_REF} の実測値で推測しています" \
         -v HEADERS="$HDR_EST" -v CLASSES="sscnnnnncs" \
         -v WIDTHS="10,58,9,11,11,12,11,14,14,70" \
         -v ESTCOL=0 -v ALLEST=1 \
@@ -1731,6 +1787,7 @@ print_summary() {
   printf ' 対象ディレクトリ : %s\n' "$ROOT_ABS"
   printf ' 計測条件         : %s\n' "$EFF_DEF"
   printf ' 環境ディレクトリ : %s\n' "${ENV_FOUND:-(該当なし)}"
+  printf ' 配置先           : %s\n' "${ENV_BASES:-(該当なし)}"
   printf '%s\n' "$bar"
   awk -F'\t' '{ printf " %-24s : %12s\n", $1, $2 }' "$F_SUM_TOTAL"
   if [ "$OPT_SUMMARY_EXT" -eq 1 ]; then
@@ -1776,6 +1833,8 @@ setup_workspace() {
   F_MAT_BODY="$WORK/matrix_body.tsv"
   F_META="$WORK/meta.tsv"
   F_KPI="$WORK/kpi.tsv"
+  F_ENV_DIRS="$WORK/env_dirs.tsv"
+  F_EST_STAT="$WORK/est_stat.tsv"
   V_FILES="$WORK/view_files.tsv"
   V_RES="$WORK/view_res.tsv"
   V_EST="$WORK/view_est.tsv"
